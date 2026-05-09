@@ -264,6 +264,18 @@ FALLBACK_ATTACHMENT_TEXT = "[Attachment]"
 
 _PREFERRED_LOCALES = ("zh_cn", "en_us")
 _MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-!|>~])")
+_LATEX_DELIMITER_RE = re.compile(r"(\\\(|\\\)|\\\[|\\\]|\$\$)")
+_LATEX_COMMAND_REPLACEMENTS = {
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε",
+    "theta": "θ", "lambda": "λ", "mu": "μ", "pi": "π", "rho": "ρ", "sigma": "σ",
+    "tau": "τ", "phi": "φ", "omega": "ω", "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ",
+    "Lambda": "Λ", "Pi": "Π", "Sigma": "Σ", "Phi": "Φ", "Omega": "Ω",
+    "times": "×", "cdot": "·", "div": "÷", "pm": "±", "mp": "∓",
+    "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥", "neq": "≠", "ne": "≠",
+    "approx": "≈", "sim": "∼", "equiv": "≡", "to": "→", "rightarrow": "→", "leftarrow": "←",
+    "infty": "∞", "partial": "∂", "nabla": "∇", "forall": "∀", "exists": "∃", "in": "∈",
+    "notin": "∉", "subset": "⊂", "subseteq": "⊆", "cup": "∪", "cap": "∩",
+}
 _MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
 _MENTION_BOUNDARY_CHARS = frozenset(" \t\n\r.,;:!?、，。；：！？()[]{}<>\"'`")
 _TRAILING_TERMINAL_PUNCT = frozenset(" \t\n\r.!?。！？")
@@ -387,6 +399,7 @@ class FeishuAdapterSettings:
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
+    latex_normalization_enabled: bool = False
 
 
 @dataclass
@@ -412,6 +425,173 @@ class FeishuBatchState:
 
 def _escape_markdown_text(text: str) -> str:
     return _MARKDOWN_SPECIAL_CHARS_RE.sub(r"\\\1", text)
+
+
+def _consume_braced_group(text: str, start: int) -> tuple[str, int] | None:
+    if start >= len(text) or text[start] != "{":
+        return None
+    depth = 0
+    body_start = start + 1
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[body_start:index], index + 1
+    return None
+
+
+def _normalize_latex_math_segment(segment: str) -> str:
+    """Best-effort conversion of common LaTeX math into Feishu-readable text."""
+    result: List[str] = []
+    index = 0
+    while index < len(segment):
+        if segment.startswith(r"\frac", index):
+            numerator = _consume_braced_group(segment, index + len(r"\frac"))
+            if numerator:
+                denominator = _consume_braced_group(segment, numerator[1])
+                if denominator:
+                    result.append(
+                        f"({_normalize_latex_math_segment(numerator[0])})/({_normalize_latex_math_segment(denominator[0])})"
+                    )
+                    index = denominator[1]
+                    continue
+        if segment.startswith(r"\sqrt", index):
+            radicand = _consume_braced_group(segment, index + len(r"\sqrt"))
+            if radicand:
+                result.append(f"√({_normalize_latex_math_segment(radicand[0])})")
+                index = radicand[1]
+                continue
+        if segment[index] == "\\":
+            match = re.match(r"\\([A-Za-z]+)", segment[index:])
+            if match:
+                command = match.group(1)
+                result.append(_LATEX_COMMAND_REPLACEMENTS.get(command, match.group(0)))
+                index += len(match.group(0))
+                continue
+            if index + 1 < len(segment):
+                result.append(segment[index:index + 2])
+                index += 2
+                continue
+        if segment[index] in "{}":
+            index += 1
+            continue
+        result.append(segment[index])
+        index += 1
+    return "".join(result)
+
+
+def _normalize_bare_latex_commands(segment: str) -> str:
+    """Normalize LaTeX commands outside delimiters without stripping ordinary braces."""
+    result: List[str] = []
+    index = 0
+    while index < len(segment):
+        if segment.startswith(r"\frac", index):
+            numerator = _consume_braced_group(segment, index + len(r"\frac"))
+            if numerator:
+                denominator = _consume_braced_group(segment, numerator[1])
+                if denominator:
+                    result.append(
+                        f"({_normalize_latex_math_segment(numerator[0])})/({_normalize_latex_math_segment(denominator[0])})"
+                    )
+                    index = denominator[1]
+                    continue
+        if segment.startswith(r"\sqrt", index):
+            radicand = _consume_braced_group(segment, index + len(r"\sqrt"))
+            if radicand:
+                result.append(f"√({_normalize_latex_math_segment(radicand[0])})")
+                index = radicand[1]
+                continue
+        if segment[index] == "\\":
+            match = re.match(r"\\([A-Za-z]+)", segment[index:])
+            if match and match.group(1) in _LATEX_COMMAND_REPLACEMENTS:
+                result.append(_LATEX_COMMAND_REPLACEMENTS[match.group(1)])
+                index += len(match.group(0))
+                continue
+        result.append(segment[index])
+        index += 1
+    return "".join(result)
+
+
+def _strip_latex_math_delimiters(text: str) -> str:
+    return _LATEX_DELIMITER_RE.sub("", text)
+
+
+def _normalize_latex_in_plain_segment(segment: str) -> str:
+    segment = re.sub(
+        r"\\\((.*?)\\\)",
+        lambda match: _normalize_latex_math_segment(match.group(1)),
+        segment,
+        flags=re.DOTALL,
+    )
+    segment = re.sub(
+        r"\\\[(.*?)\\\]",
+        lambda match: _normalize_latex_math_segment(match.group(1)),
+        segment,
+        flags=re.DOTALL,
+    )
+    segment = re.sub(
+        r"\$\$(.*?)\$\$",
+        lambda match: _normalize_latex_math_segment(match.group(1)),
+        segment,
+        flags=re.DOTALL,
+    )
+    # Single-dollar math is ambiguous with currency. Treat it as math only when
+    # the opening `$` is not directly starting a numeric amount (e.g. `$50`) and
+    # not part of a currency suffix such as `US$199`.
+    segment = re.sub(
+        r"(?<![\\A-Za-z0-9_])\$(?![\$\d])(.+?)(?<!\\)\$",
+        lambda match: _normalize_latex_math_segment(match.group(1)),
+        segment,
+        flags=re.DOTALL,
+    )
+    # Some models emit bare LaTeX commands without explicit math delimiters.
+    segment = _normalize_bare_latex_commands(segment)
+    return _strip_latex_math_delimiters(segment)
+
+
+def _normalize_latex_for_feishu(content: str) -> str:
+    """Normalize LaTeX-ish model output while leaving fenced/inline code intact."""
+    parts: List[str] = []
+    current: List[str] = []
+    in_fence = False
+
+    def flush_plain() -> None:
+        nonlocal current
+        if current:
+            parts.append(_normalize_latex_in_plain_segment("".join(current)))
+            current = []
+
+    for line in content.splitlines(keepends=True):
+        if line.lstrip().startswith("```"):
+            if not in_fence:
+                flush_plain()
+            in_fence = not in_fence
+            parts.append(line)
+            continue
+        if in_fence:
+            parts.append(line)
+            continue
+        position = 0
+        while position < len(line):
+            match = re.search(r"`+", line[position:])
+            if not match:
+                current.append(line[position:])
+                break
+            start = position + match.start()
+            tick_run = match.group(0)
+            end = line.find(tick_run, start + len(tick_run))
+            if end == -1:
+                current.append(line[position:])
+                break
+            current.append(line[position:start])
+            flush_plain()
+            parts.append(line[start:end + len(tick_run)])
+            position = end + len(tick_run)
+    flush_plain()
+    return "".join(parts)
 
 
 def _to_boolean(value: Any) -> bool:
@@ -1389,6 +1569,12 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Default group policy (for groups not in group_rules)
         default_group_policy = str(extra.get("default_group_policy", "")).strip().lower()
+        latex_normalization_enabled = _to_boolean(
+            extra.get(
+                "latex_normalization_enabled",
+                extra.get("latex_normalization", os.getenv("HERMES_FEISHU_LATEX_NORMALIZATION", "false")),
+            )
+        )
 
         return FeishuAdapterSettings(
             app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
@@ -1446,6 +1632,7 @@ class FeishuAdapter(BasePlatformAdapter):
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
+            latex_normalization_enabled=latex_normalization_enabled,
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1476,6 +1663,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
         self._ws_ping_timeout = settings.ws_ping_timeout
+        self._latex_normalization_enabled = settings.latex_normalization_enabled
+
+    def set_latex_normalization_enabled(self, enabled: bool) -> None:
+        """Enable or disable outbound LaTeX normalization for this Feishu adapter."""
+        self._latex_normalization_enabled = bool(enabled)
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -2035,8 +2227,11 @@ class FeishuAdapter(BasePlatformAdapter):
             return fallback
 
     def format_message(self, content: str) -> str:
-        """Feishu text messages are plain text by default."""
-        return content.strip()
+        """Normalize outbound Feishu text before choosing text vs post payload."""
+        stripped = content.strip()
+        if not getattr(self, "_latex_normalization_enabled", False):
+            return stripped
+        return _normalize_latex_for_feishu(stripped)
 
     # =========================================================================
     # Inbound event handlers
